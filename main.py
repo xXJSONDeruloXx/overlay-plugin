@@ -21,11 +21,14 @@ def get_clean_env() -> dict:
     # Remove library path overrides that cause OpenSSL version conflicts
     env.pop("LD_LIBRARY_PATH", None)
     env.pop("LD_PRELOAD", None)
+    # Ensure DISPLAY is set for X11 tools (gamescope uses :0 or :1)
+    if "DISPLAY" not in env:
+        env["DISPLAY"] = ":0"
     return env
 
 
 class Plugin:
-    # Track running flatpak overlay processes: {app_id: {"process": Popen, "pid": int, "window_id": str}}
+    # Track running flatpak overlay processes: {app_id: {"process": Popen, "pid": int, "window_id": str, "launching": bool}}
     flatpak_processes: Dict[str, dict] = {}
 
     async def list_installed_flatpaks(self) -> List[dict]:
@@ -92,31 +95,32 @@ class Plugin:
                 env=get_clean_env()
             )
             
-            # Store process info
+            # Store process info - mark as launching to prevent cleanup race
             self.flatpak_processes[app_id] = {
                 "process": proc,
                 "pid": proc.pid,
-                "window_id": None
+                "window_id": None,
+                "launching": True
             }
             
             # Wait for window to spawn (run in executor to not block)
             await asyncio.get_event_loop().run_in_executor(
-                None, lambda: time.sleep(1.5)
+                None, lambda: time.sleep(2.0)
             )
             
-            # Check if process is still running
-            if proc.poll() is not None:
-                del self.flatpak_processes[app_id]
-                return {
-                    "success": False,
-                    "error": f"Process exited immediately with code {proc.returncode}"
-                }
+            # Note: flatpak run is a wrapper that may exit while app continues running
+            # So we don't check proc.poll() here - instead rely on window detection
             
             # Make the window float as an overlay
-            window_id = await self._make_window_overlay(proc.pid)
+            window_id = await self._make_window_overlay(proc.pid, app_id)
+            
+            # Mark as no longer launching
+            if app_id in self.flatpak_processes:
+                self.flatpak_processes[app_id]["launching"] = False
             
             if window_id:
-                self.flatpak_processes[app_id]["window_id"] = window_id
+                if app_id in self.flatpak_processes:
+                    self.flatpak_processes[app_id]["window_id"] = window_id
                 decky.logger.info(f"Successfully launched {app_id} as overlay (window: {window_id})")
                 return {
                     "success": True,
@@ -142,27 +146,79 @@ class Plugin:
             decky.logger.error(f"Error launching flatpak overlay: {e}")
             return {"success": False, "error": str(e)}
 
-    async def _make_window_overlay(self, pid: int) -> Optional[str]:
-        """Set GAMESCOPE_EXTERNAL_OVERLAY property on the window for the given PID."""
+    async def _make_window_overlay(self, pid: int, app_id: str) -> Optional[str]:
+        """Set GAMESCOPE_EXTERNAL_OVERLAY property on the window for the given app.
+        
+        Note: flatpak runs apps in a sandbox with a different PID, so we search
+        by window name/class derived from the app_id instead of the wrapper PID.
+        """
         try:
-            # Find window ID by PID using xdotool
-            result = subprocess.run(
-                ["xdotool", "search", "--pid", str(pid)],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                env=get_clean_env()
-            )
+            # Extract app name from app_id (e.g., "app.xemu.xemu" -> "xemu")
+            app_name = app_id.split(".")[-1]
             
-            if result.returncode != 0 or not result.stdout.strip():
-                decky.logger.warning(f"No window found for PID {pid}")
+            decky.logger.info(f"Searching for window matching app: {app_name} (pid hint: {pid})")
+            
+            # Retry loop - app windows can take time to appear
+            window_id = None
+            max_retries = 5
+            
+            for attempt in range(max_retries):
+                if attempt > 0:
+                    decky.logger.info(f"Retry {attempt}/{max_retries} searching for {app_name} window...")
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: time.sleep(1.0)
+                    )
+                
+                # Strategy 1: Search by class name (most reliable for flatpaks)
+                result = subprocess.run(
+                    ["xdotool", "search", "--class", app_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    env=get_clean_env()
+                )
+                
+                if result.returncode == 0 and result.stdout.strip():
+                    window_ids = result.stdout.strip().split("\n")
+                    window_id = window_ids[-1]  # Get the most recent window
+                    decky.logger.info(f"Found window by class: {window_id}")
+                    break
+                
+                # Strategy 2: Search by name if class didn't work
+                result = subprocess.run(
+                    ["xdotool", "search", "--name", app_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    env=get_clean_env()
+                )
+                
+                if result.returncode == 0 and result.stdout.strip():
+                    window_ids = result.stdout.strip().split("\n")
+                    window_id = window_ids[-1]
+                    decky.logger.info(f"Found window by name: {window_id}")
+                    break
+                
+                # Strategy 3: Try the original PID approach as fallback
+                result = subprocess.run(
+                    ["xdotool", "search", "--pid", str(pid)],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    env=get_clean_env()
+                )
+                
+                if result.returncode == 0 and result.stdout.strip():
+                    window_ids = result.stdout.strip().split("\n")
+                    window_id = window_ids[0]
+                    decky.logger.info(f"Found window by PID: {window_id}")
+                    break
+            
+            if not window_id:
+                decky.logger.warning(f"No window found for {app_name}")
                 return None
             
-            # Get the first window ID (there might be multiple)
-            window_ids = result.stdout.strip().split("\n")
-            window_id = window_ids[0]
-            
-            decky.logger.info(f"Found window {window_id} for PID {pid}")
+            decky.logger.info(f"Setting GAMESCOPE_EXTERNAL_OVERLAY on window {window_id}")
             
             # Set the GAMESCOPE_EXTERNAL_OVERLAY property
             # This tells gamescope to render this window as an external overlay (zpos 2)
@@ -238,9 +294,27 @@ class Plugin:
         to_remove = []
         
         for app_id, proc_info in self.flatpak_processes.items():
+            # Skip apps that are still launching (to avoid race conditions)
+            if proc_info.get("launching", False):
+                running.append({
+                    "app_id": app_id,
+                    "pid": proc_info["pid"],
+                    "window_id": proc_info["window_id"]
+                })
+                continue
+                
             proc = proc_info["process"]
-            # Check if still running
-            if proc.poll() is None:
+            # Check if still running (only for non-launching apps)
+            # Note: flatpak wrapper may have exited but app runs - check window instead
+            if proc_info.get("window_id"):
+                # Has a window, consider it running
+                running.append({
+                    "app_id": app_id,
+                    "pid": proc_info["pid"],
+                    "window_id": proc_info["window_id"]
+                })
+            elif proc.poll() is None:
+                # Process still running
                 running.append({
                     "app_id": app_id,
                     "pid": proc_info["pid"],
