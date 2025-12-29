@@ -306,6 +306,7 @@ export default definePlugin(() => {
     // The element displayed at the top of your plugin's menu
     titleView: <div className={staticClasses.Title}>Overlay Launcher</div>,
     // The content of your plugin's menu
+    alwaysRender: true,
     content: <Content />,
     // The icon displayed in the plugin list
     icon: <FaLayerGroup />,
