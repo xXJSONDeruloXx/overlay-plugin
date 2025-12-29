@@ -1,7 +1,7 @@
 {
-  "name": "decky-plugin-template",
-  "version": "0.0.1",
-  "description": "A template to quickly create decky plugins from scratch, based on TypeScript and webpack",
+  "name": "overlay-launcher",
+  "version": "0.1.0",
+  "description": "Launch Flatpak applications as floating overlay windows in gamescope",
   "type": "module",
   "scripts": {
     "build": "rollup -c",
