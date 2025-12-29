@@ -23,7 +23,7 @@ interface FlatpakApp {
 interface RunningOverlay {
   app_id: string;
   pid: number;
-  window_id: string | null;
+  window_ids: string[];
 }
 
 interface LaunchResult {
@@ -33,6 +33,14 @@ interface LaunchResult {
   window_id?: string;
   error?: string;
   warning?: string;
+}
+
+interface RefreshResult {
+  success: boolean;
+  app_id?: string;
+  total_windows?: number;
+  new_windows?: number;
+  error?: string;
 }
 
 interface DependencyCheck {
@@ -50,6 +58,7 @@ const launchFlatpakOverlay = callable<[app_id: string], LaunchResult>("launch_fl
 const closeFlatpakOverlay = callable<[app_id: string], { success: boolean; error?: string }>("close_flatpak_overlay");
 const getRunningOverlays = callable<[], RunningOverlay[]>("get_running_overlays");
 const checkDependencies = callable<[], DependencyCheck>("check_dependencies");
+const refreshOverlayWindows = callable<[app_id: string], RefreshResult>("refresh_overlay_windows");
 
 function Content() {
   const [flatpaks, setFlatpaks] = useState<FlatpakApp[]>([]);
@@ -196,6 +205,39 @@ function Content() {
     setIsLoading(false);
   };
 
+  const handleRefreshWindows = async (appId: string) => {
+    try {
+      const result = await refreshOverlayWindows(appId);
+      if (result.success) {
+        if (result.new_windows && result.new_windows > 0) {
+          toaster.toast({
+            title: "Windows Refreshed",
+            body: `Found ${result.new_windows} new window(s), total: ${result.total_windows}`
+          });
+        } else {
+          toaster.toast({
+            title: "Windows Refreshed",
+            body: `No new windows found (${result.total_windows} total)`
+          });
+        }
+        // Refresh running overlays to update window count
+        const running = await getRunningOverlays();
+        setRunningOverlays(running);
+      } else {
+        toaster.toast({
+          title: "Refresh Failed",
+          body: result.error || "Unknown error"
+        });
+      }
+    } catch (e) {
+      console.error("Refresh windows error:", e);
+      toaster.toast({
+        title: "Error",
+        body: "Failed to refresh overlay windows"
+      });
+    }
+  };
+
   if (isLoading) {
     return (
       <PanelSection title="Overlay Launcher">
@@ -271,26 +313,57 @@ function Content() {
             const appInfo = flatpaks.find(f => f.app_id === overlay.app_id);
             const displayName = appInfo?.name || overlay.app_id;
             const isClosing = closingApps.has(overlay.app_id);
+            const windowCount = overlay.window_ids?.length || 0;
             
             return (
-              <PanelSectionRow key={overlay.app_id}>
-                <ButtonItem
-                  layout="below"
-                  onClick={() => handleClose(overlay.app_id)}
-                  disabled={isClosing}
-                >
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%" }}>
-                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
+              <div key={overlay.app_id}>
+                <PanelSectionRow>
+                  <div style={{ 
+                    display: "flex", 
+                    alignItems: "center", 
+                    justifyContent: "space-between",
+                    width: "100%",
+                    padding: "4px 0"
+                  }}>
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, fontSize: "14px" }}>
                       {displayName}
                     </span>
-                    <div style={{ display: "flex", alignItems: "center", gap: "4px", marginLeft: "8px" }}>
-                      {isClosing ? <Spinner width={14} height={14} /> : <FaTimes style={{ color: "#ff6b6b" }} />}
-                    </div>
+                    <span style={{ color: "#888", fontSize: "11px", marginLeft: "8px" }}>
+                      {windowCount} win
+                    </span>
                   </div>
-                </ButtonItem>
-              </PanelSectionRow>
+                </PanelSectionRow>
+                <PanelSectionRow>
+                  <ButtonItem
+                    layout="below"
+                    onClick={() => handleRefreshWindows(overlay.app_id)}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "6px" }}>
+                      <FaSync style={{ fontSize: "12px" }} />
+                      Refresh Windows
+                    </div>
+                  </ButtonItem>
+                </PanelSectionRow>
+                <PanelSectionRow>
+                  <ButtonItem
+                    layout="below"
+                    onClick={() => handleClose(overlay.app_id)}
+                    disabled={isClosing}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "6px" }}>
+                      {isClosing ? <Spinner width={14} height={14} /> : <FaTimes style={{ color: "#ff6b6b" }} />}
+                      Close Overlay
+                    </div>
+                  </ButtonItem>
+                </PanelSectionRow>
+              </div>
             );
           })}
+          <PanelSectionRow>
+            <div style={{ color: "#888", fontSize: "11px", padding: "4px 0" }}>
+              💡 If input isn't working, try "Refresh Windows"
+            </div>
+          </PanelSectionRow>
         </PanelSection>
       )}
     </>
